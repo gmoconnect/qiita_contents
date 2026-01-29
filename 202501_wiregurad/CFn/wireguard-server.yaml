@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WireGuard VPN Server on Ubuntu 24.04 ARM with Session Manager access'
+
+Parameters:
+  EIPAllocationId:
+    Type: String
+    Description: Allocation ID of the Elastic IP to associate with the WireGuard server
+    AllowedPattern: ^eipalloc-[0-9a-f]+$
+    ConstraintDescription: Must be a valid EIP Allocation ID (eipalloc-xxxxxxxxx)
+
+  AmiId:
+    Type: String
+    Description: AMI ID for Ubuntu 24.04 amd64 (ap-northeast-1)
+    Default: ami-0f65fc8c24ec8d2a1
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  WireGuardPort:
+    Type: Number
+    Description: UDP port for WireGuard VPN
+    Default: 51820
+    MinValue: 1024
+    MaxValue: 65535
+
+  KeyPairName:
+    Type: String
+    Description: EC2 KeyPair name for instance access
+    Default: wg-keypair-ec2
+
+  PrefixListName:
+    Type: String
+    Description: Name for the WireGuard client IP prefix list
+    Default: wireguard-allowed-clients
+
+Resources:
+  # VPC Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: wireguard-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: wireguard-public-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: wireguard-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: wireguard-public-rt
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Prefix List for WireGuard Client IPs
+  WireGuardClientPrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      PrefixListName: !Ref PrefixListName
+      AddressFamily: IPv4
+      MaxEntries: 50
+      Entries: []
+      Tags:
+        - Key: Name
+          Value: !Ref PrefixListName
+
+  # Security Group
+  WireGuardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WireGuard VPN server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: !Ref WireGuardPort
+          ToPort: !Ref WireGuardPort
+          SourcePrefixListId: !Ref WireGuardClientPrefixList
+          Description: WireGuard VPN access from allowed clients
+      Tags:
+        - Key: Name
+          Value: wireguard-sg
+
+  # IAM Role for Session Manager
+  WireGuardInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-wireguard-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: wireguard-instance-role
+
+  WireGuardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-wireguard-profile'
+      Roles:
+        - !Ref WireGuardInstanceRole
+
+  # EC2 Instance
+  WireGuardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref WireGuardInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !Ref PublicSubnet
+          GroupSet:
+            - !Ref WireGuardSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Update system
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install WireGuard
+          apt-get install -y wireguard
+          
+          # Disable UFW firewall
+          systemctl disable ufw
+          systemctl stop ufw
+          
+          # Enable IP forwarding
+          echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+          echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+          sysctl -p
+          
+          # Create WireGuard directory with proper permissions
+          mkdir -p /etc/wireguard
+          chmod 700 /etc/wireguard
+      Tags:
+        - Key: Name
+          Value: wireguard-server
+
+  # Associate EIP with Instance
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !Ref EIPAllocationId
+      InstanceId: !Ref WireGuardInstance
+
+Outputs:
+  WireGuardPublicIP:
+    Description: WireGuard server public IP address
+    Value: !GetAtt WireGuardInstance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+
+  PrefixListId:
+    Description: Prefix List ID for manually adding allowed client IPs
+    Value: !Ref WireGuardClientPrefixList
+    Export:
+      Name: !Sub '${AWS::StackName}-PrefixListId'
+
+  InstanceId:
+    Description: EC2 Instance ID for Session Manager access
+    Value: !Ref WireGuardInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  SessionManagerCommand:
+    Description: AWS CLI command to connect via Session Manager
+    Value: !Sub 'aws ssm start-session --target ${WireGuardInstance} --region ${AWS::Region}'
